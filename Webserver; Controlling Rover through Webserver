@@ -1,0 +1,47 @@
+<script>
+    let activeKey = null;
+
+    function send(cmd) {
+        fetch('/command/' + cmd)
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('status').innerText = data.status;
+            });
+    }
+
+    // KEY DOWN
+    document.addEventListener('keydown', (e) => {
+        const key = e.key.toLowerCase();
+
+        // Prevent repeat spam
+        if (activeKey === key) return;
+
+        activeKey = key;
+
+        if (key === 'w' || key === 'arrowup') {
+            send('forward');
+        }
+
+        else if (key === 's' || key === 'arrowdown') {
+            send('backward');
+        }
+
+        else if (key === 'a' || key === 'arrowleft') {
+            send('left');
+        }
+
+        else if (key === 'd' || key === 'arrowright') {
+            send('right');
+        }
+
+        else if (key === ' ') {
+            send('stop');
+        }
+    });
+
+    // KEY UP = STOP
+    document.addEventListener('keyup', (e) => {
+        activeKey = null;
+        send('stop');
+    });
+</script>

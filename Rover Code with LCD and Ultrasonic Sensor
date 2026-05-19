@@ -1,1 +1,236 @@
+import RPi.GPIO as GPIO
+import time
+from RPLCD.i2c import CharLCD
 
+# -------------------------
+# Motor Pins (L298N)
+# -------------------------
+LEFT_IN1  = 17
+LEFT_IN2  = 27
+RIGHT_IN1 = 22
+RIGHT_IN2 = 23
+
+# -------------------------
+# Ultrasonic Sensor Pins (HC-SR04)
+# -------------------------
+TRIG = 5
+ECHO = 6
+
+# -------------------------
+# LCD Configuration (I2C)
+# -------------------------
+#
+# Wiring — I2C LCD (PCF8574 backpack) to Raspberry Pi
+# ┌─────────────────┬──────────────────────────────────────┐
+# │ LCD I2C Pin     │ Raspberry Pi Pin                     │
+# ├─────────────────┼──────────────────────────────────────┤
+# │ GND             │ Pin 9  (GND)                         │
+# │ VCC             │ Pin 4  (5V Power)                    │
+# │ SDA             │ Pin 3  (GPIO 2, I2C SDA)             │
+# │ SCL             │ Pin 5  (GPIO 3, I2C SCL)             │
+# └─────────────────┴──────────────────────────────────────┘
+#
+# Notes:
+#   - The I2C LCD module only needs these 4 wires (GND, VCC, SDA, SCL).
+#   - SDA and SCL have built-in pull-up resistors on the Pi — no extras needed.
+#   - To enable I2C: sudo raspi-config → Interface Options → I2C → Enable
+#   - To confirm address: sudo i2cdetect -y 1  (look for 0x27 or 0x3F)
+#   - Adjust contrast using the small potentiometer on the back of the module.
+#
+# Common I2C addresses: 0x27 or 0x3F
+LCD_ADDRESS = 0x27
+LCD_COLS    = 16
+LCD_ROWS    = 2
+
+# -------------------------
+# Configuration
+# -------------------------
+OBSTACLE_DISTANCE_CM = 20   # Stop threshold (cm)
+SENSOR_TIMEOUT_S     = 0.04 # 40 ms (~6.8 m max range)
+MIN_VALID_CM         = 2    # Below this = bad reading
+MAX_VALID_CM         = 400  # Above this = bad reading
+SAMPLES              = 3    # Readings to average per cycle
+
+# -------------------------
+# GPIO Setup
+# -------------------------
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+for pin in (LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2):
+    GPIO.setup(pin, GPIO.OUT)
+
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+
+GPIO.output(TRIG, False)
+time.sleep(2)   # Let sensor settle
+
+# -------------------------
+# LCD Setup
+# -------------------------
+lcd = CharLCD(
+    i2c_expander='PCF8574',
+    address=LCD_ADDRESS,
+    port=1,              # I2C bus 1 (default on Pi 2+)
+    cols=LCD_COLS,
+    rows=LCD_ROWS,
+    dotsize=8,
+    charmap='A02',
+    auto_linebreaks=True,
+    backlight_enabled=True
+)
+
+def lcd_show(line1: str, line2: str = ""):
+    """
+    Write up to two lines to the LCD, padded/truncated to LCD_COLS.
+    Clears the display before writing.
+    """
+    lcd.clear()
+    lcd.write_string(line1[:LCD_COLS].ljust(LCD_COLS))
+    if LCD_ROWS >= 2:
+        lcd.crlf()
+        lcd.write_string(line2[:LCD_COLS].ljust(LCD_COLS))
+
+# Startup message
+lcd_show("Robot Car", "Initializing...")
+time.sleep(1)
+
+# -------------------------
+# Motor Functions
+# -------------------------
+def move_forward():
+    GPIO.output(LEFT_IN1,  GPIO.HIGH)
+    GPIO.output(LEFT_IN2,  GPIO.LOW)
+    GPIO.output(RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(RIGHT_IN2, GPIO.LOW)
+
+def move_backward():
+    GPIO.output(LEFT_IN1,  GPIO.LOW)
+    GPIO.output(LEFT_IN2,  GPIO.HIGH)
+    GPIO.output(RIGHT_IN1, GPIO.LOW)
+    GPIO.output(RIGHT_IN2, GPIO.HIGH)
+
+def turn_left():
+    GPIO.output(LEFT_IN1,  GPIO.LOW)
+    GPIO.output(LEFT_IN2,  GPIO.HIGH)
+    GPIO.output(RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(RIGHT_IN2, GPIO.LOW)
+
+def turn_right():
+    GPIO.output(LEFT_IN1,  GPIO.HIGH)
+    GPIO.output(LEFT_IN2,  GPIO.LOW)
+    GPIO.output(RIGHT_IN1, GPIO.LOW)
+    GPIO.output(RIGHT_IN2, GPIO.HIGH)
+
+def stop():
+    for pin in (LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2):
+        GPIO.output(pin, GPIO.LOW)
+
+# -------------------------
+# Sensor Function
+# -------------------------
+def get_distance():
+    """
+    Returns distance in cm, or None if the reading is invalid/timed out.
+    """
+    # Send 10 µs trigger pulse
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    deadline = time.time() + SENSOR_TIMEOUT_S
+
+    # Wait for echo to go HIGH
+    pulse_start = time.time()
+    while GPIO.input(ECHO) == 0:
+        pulse_start = time.time()
+        if pulse_start > deadline:
+            return None  # Sensor not responding
+
+    # Wait for echo to go LOW
+    pulse_end = time.time()
+    while GPIO.input(ECHO) == 1:
+        pulse_end = time.time()
+        if pulse_end > deadline:
+            return None  # Echo held high too long
+
+    distance = (pulse_end - pulse_start) * 17150
+    distance = round(distance, 2)
+
+    if not (MIN_VALID_CM < distance < MAX_VALID_CM):
+        return None  # Out-of-range / noise
+
+    return distance
+
+def get_stable_distance():
+    """
+    Average multiple valid readings. Returns None if no valid sample.
+    """
+    readings = [get_distance() for _ in range(SAMPLES)]
+    valid = [r for r in readings if r is not None]
+    if not valid:
+        return None
+    return round(sum(valid) / len(valid), 2)
+
+# -------------------------
+# Obstacle Avoidance
+# -------------------------
+def avoid_obstacle():
+    """
+    Simple avoidance: reverse briefly, then turn right.
+    """
+    print("  -> Reversing...")
+    lcd_show("OBSTACLE!", "Reversing...")
+    move_backward()
+    time.sleep(0.5)
+
+    print("  -> Turning right...")
+    lcd_show("OBSTACLE!", "Turning Right...")
+    turn_right()
+    time.sleep(0.4)
+
+    stop()
+
+# -------------------------
+# Main Loop
+# -------------------------
+print("Robot car started. Press Ctrl+C to stop.\n")
+lcd_show("Robot Car Ready", "Press Ctrl+C=Stop")
+time.sleep(1)
+
+try:
+    while True:
+        distance = get_stable_distance()
+
+        if distance is None:
+            print("Sensor error — skipping cycle")
+            lcd_show("Sensor Error", "Skipping...")
+            time.sleep(0.1)
+            continue
+
+        print(f"Distance: {distance} cm")
+
+        if distance > OBSTACLE_DISTANCE_CM:
+            move_forward()
+            lcd_show("Moving Forward", f"Dist: {distance} cm")
+        else:
+            stop()
+            print("Obstacle detected!")
+            lcd_show("OBSTACLE!", f"Dist: {distance} cm")
+            time.sleep(0.3)   # Brief pause so user can read LCD
+            avoid_obstacle()
+
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    print("\nStopping robot.")
+    lcd_show("Stopped", "Goodbye!")
+    time.sleep(1)
+
+finally:
+    stop()
+    GPIO.cleanup()
+    lcd.clear()
+    lcd.backlight_enabled = False
+    print("GPIO cleaned up. Bye!")

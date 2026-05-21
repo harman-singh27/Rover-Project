@@ -1,1 +1,995 @@
 
+from flask import Flask, render_template_string, Response, jsonify
+import RPi.GPIO as GPIO
+import cv2
+import numpy as np
+from RPLCD.i2c import CharLCD
+
+# =========================================================
+# MOTOR PINS
+# =========================================================
+LEFT_IN1  = 17
+LEFT_IN2  = 27
+RIGHT_IN1 = 22
+RIGHT_IN2 = 23
+
+# =========================================================
+# LCD CONFIG
+# =========================================================
+LCD_ADDRESS = 0x27
+LCD_COLS = 16
+LCD_ROWS = 2
+
+# =========================================================
+# GPIO SETUP
+# =========================================================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+motor_pins = [LEFT_IN1, LEFT_IN2, RIGHT_IN1, RIGHT_IN2]
+
+for pin in motor_pins:
+    GPIO.setup(pin, GPIO.OUT)
+
+# =========================================================
+# LCD SETUP
+# =========================================================
+lcd = CharLCD(
+    i2c_expander='PCF8574',
+    address=LCD_ADDRESS,
+    port=1,
+    cols=LCD_COLS,
+    rows=LCD_ROWS,
+    dotsize=8,
+    charmap='A02',
+    auto_linebreaks=True,
+    backlight_enabled=True
+)
+
+def lcd_show(line1="", line2=""):
+    lcd.clear()
+    lcd.write_string(line1[:16])
+    lcd.crlf()
+    lcd.write_string(line2[:16])
+
+lcd_show("Rover Online", "Ready")
+
+# =========================================================
+# CAMERA SETUP  —  bumped to 1280x720
+# =========================================================
+camera = cv2.VideoCapture(0)
+
+camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+actual_w = camera.get(cv2.CAP_PROP_FRAME_WIDTH)
+actual_h = camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+print(f"Camera resolution: {int(actual_w)}x{int(actual_h)}")
+
+if not camera.isOpened():
+    print("ERROR: CAMERA NOT FOUND")
+    exit()
+
+# =========================================================
+# GLOBALS
+# =========================================================
+detected_color = "None"
+
+# =========================================================
+# MOTOR FUNCTIONS
+# =========================================================
+def stop():
+    for pin in motor_pins:
+        GPIO.output(pin, GPIO.LOW)
+
+def move_forward():
+    GPIO.output(LEFT_IN1, GPIO.HIGH)
+    GPIO.output(LEFT_IN2, GPIO.LOW)
+    GPIO.output(RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(RIGHT_IN2, GPIO.LOW)
+
+def move_backward():
+    GPIO.output(LEFT_IN1, GPIO.LOW)
+    GPIO.output(LEFT_IN2, GPIO.HIGH)
+    GPIO.output(RIGHT_IN1, GPIO.LOW)
+    GPIO.output(RIGHT_IN2, GPIO.HIGH)
+
+def turn_left():
+    GPIO.output(LEFT_IN1, GPIO.LOW)
+    GPIO.output(LEFT_IN2, GPIO.HIGH)
+    GPIO.output(RIGHT_IN1, GPIO.HIGH)
+    GPIO.output(RIGHT_IN2, GPIO.LOW)
+
+def turn_right():
+    GPIO.output(LEFT_IN1, GPIO.HIGH)
+    GPIO.output(LEFT_IN2, GPIO.LOW)
+    GPIO.output(RIGHT_IN1, GPIO.LOW)
+    GPIO.output(RIGHT_IN2, GPIO.HIGH)
+
+# =========================================================
+# COLOR DETECTION
+# =========================================================
+def detect_color(frame):
+
+    global detected_color
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # RED (wraps around hue, so two ranges)
+    red_lower1 = np.array([0, 120, 70])
+    red_upper1 = np.array([10, 255, 255])
+    red_lower2 = np.array([170, 120, 70])
+    red_upper2 = np.array([180, 255, 255])
+
+    # GREEN
+    green_lower = np.array([40, 70, 70])
+    green_upper = np.array([80, 255, 255])
+
+    # BLUE
+    blue_lower = np.array([100, 150, 0])
+    blue_upper = np.array([140, 255, 255])
+
+    # ORANGE
+    orange_lower = np.array([10, 150, 150])
+    orange_upper = np.array([25, 255, 255])
+
+    red_mask1   = cv2.inRange(hsv, red_lower1, red_upper1)
+    red_mask2   = cv2.inRange(hsv, red_lower2, red_upper2)
+    red_mask    = cv2.bitwise_or(red_mask1, red_mask2)
+    green_mask  = cv2.inRange(hsv, green_lower, green_upper)
+    blue_mask   = cv2.inRange(hsv, blue_lower, blue_upper)
+    orange_mask = cv2.inRange(hsv, orange_lower, orange_upper)
+
+    red_pixels    = cv2.countNonZero(red_mask)
+    green_pixels  = cv2.countNonZero(green_mask)
+    blue_pixels   = cv2.countNonZero(blue_mask)
+    orange_pixels = cv2.countNonZero(orange_mask)
+
+    counts = {
+        "Red":    red_pixels,
+        "Green":  green_pixels,
+        "Blue":   blue_pixels,
+        "Orange": orange_pixels,
+    }
+
+    detected_color = "None"
+    best = max(counts, key=counts.get)
+
+    if counts[best] > 5000:
+        detected_color = best
+
+    # Draw bounding box around detected color
+    if detected_color != "None":
+        color_masks = {
+            "Red":    red_mask,
+            "Green":  green_mask,
+            "Blue":   blue_mask,
+            "Orange": orange_mask,
+        }
+        box_colors = {
+            "Red":    (0, 0, 255),
+            "Green":  (0, 255, 0),
+            "Blue":   (255, 0, 0),
+            "Orange": (0, 165, 255),
+        }
+        contours, _ = cv2.findContours(
+            color_masks[detected_color],
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest)
+            cv2.rectangle(frame, (x, y), (x+w, y+h), box_colors[detected_color], 2)
+
+    cv2.putText(
+        frame,
+        f"Color: {detected_color}",
+        (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0, 255, 0),
+        2
+    )
+
+    return frame
+
+# =========================================================
+# VIDEO STREAM
+# =========================================================
+def generate_frames():
+
+    while True:
+
+        success, frame = camera.read()
+
+        if not success:
+            camera.open(0)
+            continue
+
+        # No flip — keeps left/right correct so rover movement matches screen
+        frame = detect_color(frame)
+
+        lcd_show("Detected:", detected_color)
+
+        ret, buffer = cv2.imencode('.jpg', frame)
+
+        if not ret:
+            continue
+
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' +
+            buffer.tobytes() +
+            b'\r\n'
+        )
+
+# =========================================================
+# FLASK APP
+# =========================================================
+app = Flask(__name__)
+
+# =========================================================
+# HTML  —  redesigned UI
+# =========================================================
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<meta charset="UTF-8">
+<title>Rover Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap" rel="stylesheet">
+
+<style>
+
+:root {
+    --bg:       #080c10;
+    --surface:  #0d1117;
+    --panel:    #111820;
+    --border:   #1e2d3d;
+    --accent:   #00d4ff;
+    --accent2:  #0066ff;
+    --green:    #00ff88;
+    --red:      #ff3b3b;
+    --orange:   #ff8c00;
+    --text:     #c9d1d9;
+    --muted:    #3d4f61;
+    --mono:     'Share Tech Mono', monospace;
+    --sans:     'Rajdhani', sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    overflow-x: hidden;
+}
+
+/* animated grid background */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+        linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+}
+
+body::after {
+    content: '';
+    position: fixed;
+    top: -50%;
+    left: -20%;
+    width: 60%;
+    height: 80%;
+    background: radial-gradient(ellipse, rgba(0,102,255,0.07) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.page {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px 24px 48px;
+}
+
+/* ── HEADER ── */
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.logo-icon {
+    width: 42px; height: 42px;
+    border: 2px solid var(--accent);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    box-shadow: 0 0 16px rgba(0,212,255,0.3);
+    animation: pulse-border 3s ease-in-out infinite;
+}
+
+@keyframes pulse-border {
+    0%, 100% { box-shadow: 0 0 16px rgba(0,212,255,0.3); }
+    50%       { box-shadow: 0 0 30px rgba(0,212,255,0.6); }
+}
+
+.logo-text h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: #fff;
+    line-height: 1;
+}
+
+.logo-text span {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 2px;
+}
+
+.status-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 6px 16px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--green);
+}
+
+.status-dot {
+    width: 8px; height: 8px;
+    background: var(--green);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--green);
+    animation: blink 1.4s ease-in-out infinite;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+}
+
+/* ── MAIN LAYOUT ── */
+.main-grid {
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    gap: 20px;
+    align-items: start;
+}
+
+@media (max-width: 900px) {
+    .main-grid { grid-template-columns: 1fr; }
+}
+
+/* ── CAMERA PANEL ── */
+.camera-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    position: relative;
+}
+
+.camera-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+}
+
+.camera-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+}
+
+.rec-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--red);
+    letter-spacing: 1px;
+}
+
+.rec-dot {
+    width: 7px; height: 7px;
+    background: var(--red);
+    border-radius: 50%;
+    box-shadow: 0 0 6px var(--red);
+    animation: blink 1s ease-in-out infinite;
+}
+
+.camera-body {
+    position: relative;
+    background: #000;
+    line-height: 0;
+}
+
+#camera {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    object-fit: cover;
+}
+
+/* corner brackets overlay */
+.camera-body::before,
+.camera-body::after {
+    content: '';
+    position: absolute;
+    width: 28px; height: 28px;
+    border-color: var(--accent);
+    border-style: solid;
+    opacity: 0.7;
+    z-index: 2;
+    pointer-events: none;
+}
+.camera-body::before {
+    top: 12px; left: 12px;
+    border-width: 2px 0 0 2px;
+}
+.camera-body::after {
+    bottom: 12px; right: 12px;
+    border-width: 0 2px 2px 0;
+}
+
+.color-hud {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 3;
+    background: rgba(8,12,16,0.8);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 14px;
+    backdrop-filter: blur(6px);
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: bold;
+    color: #9ca3af;
+    transition: color 0.3s, border-color 0.3s;
+    pointer-events: none;
+}
+
+.camera-footer {
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.res-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+}
+
+#cmd-status {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 1px;
+}
+
+/* ── SIDEBAR ── */
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+}
+
+.panel-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+/* ── DPAD ── */
+.dpad-wrap {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.dpad-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn {
+    width: 68px;
+    height: 58px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 22px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.12s, border-color 0.12s, transform 0.08s, box-shadow 0.12s;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.btn:hover {
+    background: #1a2535;
+    border-color: var(--accent);
+    box-shadow: 0 0 14px rgba(0,212,255,0.2);
+}
+
+.btn:active, .btn.active {
+    background: rgba(0,212,255,0.12);
+    border-color: var(--accent);
+    transform: scale(0.93);
+    box-shadow: 0 0 20px rgba(0,212,255,0.35);
+}
+
+.btn-stop {
+    background: rgba(255,59,59,0.1);
+    border-color: var(--red);
+    color: var(--red);
+}
+
+.btn-stop:hover {
+    background: rgba(255,59,59,0.2);
+    border-color: var(--red);
+    box-shadow: 0 0 14px rgba(255,59,59,0.3);
+}
+
+.btn-stop:active, .btn-stop.active {
+    background: rgba(255,59,59,0.3);
+    box-shadow: 0 0 24px rgba(255,59,59,0.5);
+}
+
+/* ── COLOR DETECTOR ── */
+.color-panel-body {
+    padding: 16px;
+}
+
+.color-swatch {
+    width: 100%;
+    height: 56px;
+    border-radius: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    color: #9ca3af;
+    transition: background 0.4s, color 0.4s, border-color 0.4s, box-shadow 0.4s;
+    margin-bottom: 12px;
+}
+
+.color-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.color-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.color-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.color-name { width: 44px; color: var(--muted); }
+
+.color-bar-bg {
+    flex: 1;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.color-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.4s ease;
+}
+
+/* ── KEYBOARD HINTS ── */
+.hint-body {
+    padding: 14px 16px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.hint-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px; height: 26px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.hint-label {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono);
+}
+
+</style>
+</head>
+
+<body>
+<div class="page">
+
+    <!-- HEADER -->
+    <header>
+        <div class="logo">
+            <div class="logo-icon">🤖</div>
+            <div class="logo-text">
+                <h1>Rover</h1>
+                <span>CONTROL INTERFACE v2.0</span>
+            </div>
+        </div>
+        <div class="status-pill">
+            <div class="status-dot"></div>
+            SYSTEM ONLINE
+        </div>
+    </header>
+
+    <!-- MAIN -->
+    <div class="main-grid">
+
+        <!-- CAMERA -->
+        <div class="camera-panel">
+            <div class="camera-topbar">
+                <span class="camera-label">📡 LIVE FEED — CAM 01</span>
+                <span class="rec-badge"><span class="rec-dot"></span>REC</span>
+            </div>
+            <div class="camera-body">
+                <img id="camera" src="/video_feed" alt="Camera Feed">
+                <div class="color-hud" id="color-hud">🎨 &nbsp;None</div>
+            </div>
+            <div class="camera-footer">
+                <span class="res-label">1280 × 720 · MJPEG</span>
+                <span id="cmd-status">STANDBY</span>
+            </div>
+        </div>
+
+        <!-- SIDEBAR -->
+        <div class="sidebar">
+
+            <!-- D-PAD -->
+            <div class="panel">
+                <div class="panel-header">Movement</div>
+                <div class="dpad-wrap">
+                    <div class="dpad-row">
+                        <button class="btn" id="btn-forward" onclick="send('forward')" title="Forward (W)">▲</button>
+                    </div>
+                    <div class="dpad-row">
+                        <button class="btn" id="btn-left" onclick="send('left')" title="Left (A)">◄</button>
+                        <button class="btn btn-stop" id="btn-stop" onclick="send('stop')" title="Stop (Space)">■</button>
+                        <button class="btn" id="btn-right" onclick="send('right')" title="Right (D)">►</button>
+                    </div>
+                    <div class="dpad-row">
+                        <button class="btn" id="btn-backward" onclick="send('backward')" title="Backward (S)">▼</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- COLOR DETECTOR -->
+            <div class="panel">
+                <div class="panel-header">Color Detection</div>
+                <div class="color-panel-body">
+                    <div class="color-swatch" id="color-swatch">— NONE —</div>
+                    <div class="color-bars">
+                        <div class="color-row">
+                            <div class="color-dot" style="background:#ef4444"></div>
+                            <span class="color-name">RED</span>
+                            <div class="color-bar-bg"><div class="color-bar-fill" id="bar-red" style="background:#ef4444"></div></div>
+                        </div>
+                        <div class="color-row">
+                            <div class="color-dot" style="background:#22c55e"></div>
+                            <span class="color-name">GREEN</span>
+                            <div class="color-bar-bg"><div class="color-bar-fill" id="bar-green" style="background:#22c55e"></div></div>
+                        </div>
+                        <div class="color-row">
+                            <div class="color-dot" style="background:#60a5fa"></div>
+                            <span class="color-name">BLUE</span>
+                            <div class="color-bar-bg"><div class="color-bar-fill" id="bar-blue" style="background:#60a5fa"></div></div>
+                        </div>
+                        <div class="color-row">
+                            <div class="color-dot" style="background:#fb923c"></div>
+                            <span class="color-name">ORANGE</span>
+                            <div class="color-bar-bg"><div class="color-bar-fill" id="bar-orange" style="background:#fb923c"></div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- KEYBOARD HINTS -->
+            <div class="panel">
+                <div class="panel-header">Keyboard Shortcuts</div>
+                <div class="hint-body">
+                    <div class="hint-row"><kbd>W</kbd><span class="hint-label">Forward</span></div>
+                    <div class="hint-row"><kbd>S</kbd><span class="hint-label">Backward</span></div>
+                    <div class="hint-row"><kbd>A</kbd><span class="hint-label">Left</span></div>
+                    <div class="hint-row"><kbd>D</kbd><span class="hint-label">Right</span></div>
+                    <div class="hint-row" style="grid-column:1/-1"><kbd style="width:100%;font-size:10px">SPC</kbd><span class="hint-label">Stop</span></div>
+                </div>
+            </div>
+
+        </div><!-- /sidebar -->
+    </div><!-- /main-grid -->
+</div><!-- /page -->
+
+<script>
+
+const colorStyles = {
+    Red:    { hex: "#ef4444", label: "RED"    },
+    Green:  { hex: "#22c55e", label: "GREEN"  },
+    Blue:   { hex: "#60a5fa", label: "BLUE"   },
+    Orange: { hex: "#fb923c", label: "ORANGE" },
+    None:   { hex: "#3d4f61", label: "— NONE —" },
+};
+
+const barIds = { Red: "bar-red", Green: "bar-green", Blue: "bar-blue", Orange: "bar-orange" };
+let activeBtn = null;
+
+function flashBtn(id) {
+    if (activeBtn) activeBtn.classList.remove("active");
+    activeBtn = document.getElementById("btn-" + id);
+    if (activeBtn) activeBtn.classList.add("active");
+    clearTimeout(window._btnTimer);
+    window._btnTimer = setTimeout(() => {
+        if (activeBtn) activeBtn.classList.remove("active");
+    }, 300);
+}
+
+function updateColor(color) {
+    const s = colorStyles[color] || colorStyles.None;
+    const hud    = document.getElementById("color-hud");
+    const swatch = document.getElementById("color-swatch");
+
+    hud.innerText = "🎨  " + s.label;
+    hud.style.color = s.hex;
+    hud.style.borderColor = s.hex;
+
+    swatch.innerText = s.label;
+    swatch.style.color = s.hex;
+    swatch.style.borderColor = color !== "None" ? s.hex : "";
+    swatch.style.boxShadow   = color !== "None" ? `0 0 20px ${s.hex}44` : "";
+
+    // animate bar for active color
+    Object.keys(barIds).forEach(c => {
+        const bar = document.getElementById(barIds[c]);
+        bar.style.width = (c === color) ? "100%" : "0%";
+    });
+}
+
+function send(cmd) {
+    flashBtn(cmd);
+    fetch('/command/' + cmd)
+        .then(r => r.json())
+        .then(data => {
+            document.getElementById("cmd-status").innerText = data.status.toUpperCase();
+            updateColor(data.color);
+        });
+}
+
+// Poll color every 500 ms
+setInterval(() => {
+    fetch('/color')
+        .then(r => r.json())
+        .then(data => updateColor(data.color));
+}, 500);
+
+// ── GAME-STYLE HELD-KEY CONTROLS ──
+// Holding a key continuously drives the rover; releasing stops it.
+const keyMap = { w: 'forward', s: 'backward', a: 'left', d: 'right' };
+const heldKeys = new Set();
+let driveLoop = null;
+
+function startDriveLoop() {
+    if (driveLoop) return;
+    driveLoop = setInterval(() => {
+        if (heldKeys.has('w'))      send('forward');
+        else if (heldKeys.has('s')) send('backward');
+        else if (heldKeys.has('a')) send('left');
+        else if (heldKeys.has('d')) send('right');
+    }, 80); // ~12 commands/sec
+}
+
+function stopDriveLoop() {
+    clearInterval(driveLoop);
+    driveLoop = null;
+}
+
+document.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === ' ') { e.preventDefault(); send('stop'); return; }
+    if (!keyMap[k]) return;
+    e.preventDefault();
+    if (heldKeys.has(k)) return;
+    heldKeys.add(k);
+    send(keyMap[k]);  // fire instantly on first press
+    startDriveLoop();
+});
+
+document.addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    if (!keyMap[k]) return;
+    heldKeys.delete(k);
+    if (heldKeys.size === 0) {
+        stopDriveLoop();
+        send('stop');  // auto-stop when all keys released
+    } else {
+        const next = ['w','s','a','d'].find(x => heldKeys.has(x));
+        if (next) send(keyMap[next]);
+    }
+});
+
+</script>
+</body>
+</html>
+"""
+
+# =========================================================
+# ROUTES
+# =========================================================
+@app.route('/')
+def index():
+    return render_template_string(HTML)
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(
+        generate_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+@app.route('/color')
+def color():
+    return jsonify({"color": detected_color})
+
+@app.route('/command/<cmd>')
+def command(cmd):
+
+    if cmd == 'forward':
+        move_forward()
+        status = "Forward"
+
+    elif cmd == 'backward':
+        move_backward()
+        status = "Backward"
+
+    elif cmd == 'left':
+        turn_left()
+        status = "Left"
+
+    elif cmd == 'right':
+        turn_right()
+        status = "Right"
+
+    elif cmd == 'stop':
+        stop()
+        status = "Stopped"
+
+    else:
+        status = "Unknown"
+
+    return jsonify({
+        "status": status,
+        "color": detected_color
+    })
+
+# =========================================================
+# RUN SERVER
+# =========================================================
+if __name__ == '__main__':
+
+    try:
+
+        print("===================================")
+        print("ROVER SERVER RUNNING")
+        print("===================================")
+
+        app.run(
+            host='0.0.0.0',
+            port=5000,
+            threaded=True,
+            debug=False
+        )
+
+    except KeyboardInterrupt:
+
+        print("Stopping...")
+
+    finally:
+
+        stop()
+
+        GPIO.cleanup()
+
+        camera.release()
+
+        lcd.clear()
+
+        lcd.backlight_enabled = False
+
+        print("Cleaned up.")
